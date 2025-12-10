@@ -1,34 +1,91 @@
-name: Run on My RDP/VPS
+name: Setup Permanent RDP on VPS
 
 on:
-  workflow_dispatch: # Manual trigger karne ke liye
-  schedule:
-    - cron: '0 */6 * * *' # Har 6 ghante pe automatically run hoga
-  push: # Ya jab bhi aap repository mein code push karen
-    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
-  run-on-rdp:
-    runs-on: self-hosted # YEH IMPORTANT HAI: Aapke apne VPS par chalega
-
+  setup-permanent-rdp:
+    runs-on: ubuntu-latest
+    
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
-
-    - name: List files
-      run: ls -la
-
-    - name: Check system info
-      run: |
-        echo "--- System Information ---"
-        free -h
-        df -h
-        uptime
-
-    - name: Run your custom script
-      run: |
-        echo "Yaha aap apna asli kaam karwate hain"
-        # Example:
-        # python3 my_bot.py
-        # node server.js
-        # ./compile.sh
+      - name: SSH into VPS and Setup Permanent Services
+        env:
+          VPS_IP: ${{ secrets.VPS_IP }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PASSWORD: ${{ secrets.VPS_PASSWORD }}
+        run: |
+          # Install sshpass for password authentication
+          sudo apt-get update && sudo apt-get install -y sshpass
+          
+          # SSH into VPS and run setup commands
+          sshpass -p "$VPS_PASSWORD" ssh -o StrictHostKeyChecking=no $VPS_USER@$VPS_IP << 'EOF'
+          
+          # Update system
+          sudo apt update && sudo apt upgrade -y
+          
+          # 1. INSTALL AND CONFIGURE RDP (xRDP)
+          sudo apt install -y xrdp xfce4 xfce4-goodies firefox
+          
+          # Configure xRDP
+          echo xfce4-session > ~/.xsession
+          sudo systemctl enable xrdp
+          sudo systemctl restart xrdp
+          
+          # 2. INSTALL TAILSCALE PERMANENTLY
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
+          sudo apt-get update
+          sudo apt-get install -y tailscale
+          
+          # Start Tailscale with auth key (store in systemd for auto-start)
+          echo "TAILSCALE_AUTH_KEY=${{ secrets.TAILSCALE_AUTH_KEY }}" | sudo tee -a /etc/default/tailscale
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=permanent-vps-$(hostname)
+          
+          # Enable Tailscale auto-start
+          sudo systemctl enable --now tailscaled
+          
+          # 3. CREATE PERMANENT USER
+          # Generate secure random password
+          PASSWORD=$(openssl rand -base64 16)
+          sudo useradd -m -s /bin/bash rdpuser
+          echo "rdpuser:$PASSWORD" | sudo chpasswd
+          sudo usermod -aG sudo rdpuser
+          
+          # 4. CREATE AUTO-RESTART SERVICE (agar RDP crash ho to restart ho)
+          sudo tee /etc/systemd/system/keep-rdp-alive.service << 'SERVICE'
+          [Unit]
+          Description=Keep RDP Service Alive
+          After=network.target xrdp.service
+          
+          [Service]
+          Type=simple
+          ExecStart=/bin/bash -c 'while true; do if ! systemctl is-active --quiet xrdp; then systemctl restart xrdp; fi; sleep 300; done'
+          Restart=always
+          
+          [Install]
+          WantedBy=multi-user.target
+          SERVICE
+          
+          sudo systemctl daemon-reload
+          sudo systemctl enable keep-rdp-alive.service
+          sudo systemctl start keep-rdp-alive.service
+          
+          # 5. DISABLE SLEEP AND AUTO-SUSPEND
+          sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
+          
+          # 6. PRINT CONNECTION DETAILS
+          TAILSCALE_IP=$(tailscale ip -4)
+          echo "=========================================="
+          echo "PERMANENT RDP SETUP COMPLETE!"
+          echo "Tailscale IP: $TAILSCALE_IP"
+          echo "Username: rdpuser"
+          echo "Password: $PASSWORD"
+          echo "=========================================="
+          
+          # Save credentials to file (secure location)
+          echo "IP: $TAILSCALE_IP" | sudo tee /root/rdp-credentials.txt
+          echo "User: rdpuser" | sudo tee -a /root/rdp-credentials.txt
+          echo "Pass: $PASSWORD" | sudo tee -a /root/rdp-credentials.txt
+          sudo chmod 600 /root/rdp-credentials.txt
+          
+          EOF
